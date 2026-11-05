@@ -5,15 +5,27 @@ from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 from message_processor import process_message
 
+from database import (
+    initialize_database,
+    is_message_processed,
+    save_message
+)
+
 
 # ==================================
 # 1. LOAD ENVIRONMENT VARIABLES
 # ==================================
 
-load_dotenv()
+load_dotenv(
+    dotenv_path=os.path.join(os.path.dirname(__file__), ".env"),
+    override=True
+)
 
-TOKEN = os.getenv("DISCORD_TOKEN")
+TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 CHANNEL_ID = os.getenv("CHANNEL_ID")
+
+if TOKEN.startswith("Bot "):
+    TOKEN = TOKEN[4:]
 
 if not TOKEN:
     raise ValueError("DISCORD_TOKEN is missing from .env")
@@ -80,6 +92,11 @@ async def on_message(message):
     if message.channel.id != CHANNEL_ID:
         return
 
+    # Check if this message was already processed
+    if is_message_processed(message.id):
+        print("Message already processed. Skipping.")
+        return
+
     print("\nNEW MESSAGE DETECTED")
 
     # Get the original message date in Algeria timezone
@@ -104,9 +121,21 @@ async def on_message(message):
 
     print("=======================================")
 
+    # Save the message in SQLite
+    save_message(
+        message.id,
+        message.channel.id,
+        message.author,
+        result
+    )
+
+    print("Message saved to database!")
+
 
 # ==================================
 # 6. START THE BOT
 # ==================================
+
+initialize_database()
 
 client.run(TOKEN)
