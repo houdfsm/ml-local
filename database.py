@@ -19,6 +19,21 @@ DATABASE_FILE = os.path.join(
 MAX_OPERATION_ATTEMPTS = 5
 MAX_NOTIFICATION_ATTEMPTS = 5
 
+# Recover messages stuck in processing for 10 minutes.
+OPERATION_TIMEOUT_MINUTES = 10
+
+
+# ==================================================
+# TIME HELPER
+# ==================================================
+
+def current_time():
+    return datetime.now(timezone.utc)
+
+
+def current_time_string():
+    return current_time().isoformat()
+
 
 # ==================================================
 # DATABASE CONNECTION
@@ -76,7 +91,8 @@ def initialize_database():
                 sync_status TEXT DEFAULT 'pending',
                 retry_count INTEGER DEFAULT 0,
                 last_error TEXT,
-                next_retry_at TEXT
+                next_retry_at TEXT,
+                operation_started_at TEXT
             )
         """)
 
@@ -111,7 +127,9 @@ def initialize_database():
             "retry_count": "INTEGER DEFAULT 0",
 
             "last_error": "TEXT",
-            "next_retry_at": "TEXT"
+            "next_retry_at": "TEXT",
+
+            "operation_started_at": "TEXT"
         }
 
         for column, definition in required_columns.items():
@@ -146,6 +164,11 @@ def initialize_database():
         connection.execute("""
             CREATE INDEX IF NOT EXISTS idx_notifications_retry
             ON notification_queue(status, next_attempt_at)
+        """)
+
+        connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_messages_operation
+            ON processed_messages(sync_status, operation_started_at)
         """)
 
     print("Database initialized successfully.")
@@ -247,7 +270,8 @@ def save_message(
                 "retry_count",
                 "processed_at",
                 "last_error",
-                "next_retry_at"
+                "next_retry_at",
+                "operation_started_at"
             )
         ]
 
@@ -304,21 +328,50 @@ def is_message_processed(message_id):
 
 # ==================================================
 # BEGIN OPERATION
+# ATOMIC MESSAGE CLAIM
 # ==================================================
 
 def begin_operation(message_id):
 
+    now = current_time()
+
+    now_string = now.isoformat()
+
+    expired_time = (
+        now - timedelta(
+            minutes=OPERATION_TIMEOUT_MINUTES
+        )
+    ).isoformat()
+
     with get_connection() as connection:
 
-        connection.execute("""
+        cursor = connection.execute("""
             UPDATE processed_messages
 
-            SET sync_status = 'pending',
+            SET sync_status = 'processing',
+                operation_started_at = ?,
                 last_error = NULL,
                 next_retry_at = NULL
 
             WHERE message_id = ?
-        """, (str(message_id),))
+
+              AND (
+                    sync_status != 'processing'
+
+                    OR operation_started_at IS NULL
+
+                    OR operation_started_at <= ?
+              )
+        """, (
+            now_string,
+            str(message_id),
+            expired_time
+        ))
+
+        # True means this task successfully claimed the message.
+        # False means another task already owns it.
+
+        return cursor.rowcount == 1
 
 
 # ==================================================
@@ -356,11 +409,12 @@ def mark_message_completed(message_id):
                 processed_at = ?,
                 retry_count = 0,
                 last_error = NULL,
-                next_retry_at = NULL
+                next_retry_at = NULL,
+                operation_started_at = NULL
 
             WHERE message_id = ?
         """, (
-            datetime.now(timezone.utc).isoformat(),
+            current_time_string(),
             str(message_id)
         ))
 
@@ -371,7 +425,7 @@ def mark_message_completed(message_id):
 
 def mark_message_failed(message_id, error):
 
-    now = datetime.now(timezone.utc)
+    now = current_time()
 
     with get_connection() as connection:
 
@@ -396,7 +450,8 @@ def mark_message_failed(message_id, error):
                 SET sync_status = 'failed',
                     retry_count = ?,
                     last_error = ?,
-                    next_retry_at = NULL
+                    next_retry_at = NULL,
+                    operation_started_at = NULL
 
                 WHERE message_id = ?
             """, (
@@ -417,7 +472,8 @@ def mark_message_failed(message_id, error):
             SET sync_status = 'pending',
                 retry_count = ?,
                 last_error = ?,
-                next_retry_at = ?
+                next_retry_at = ?,
+                operation_started_at = NULL
 
             WHERE message_id = ?
         """, (
@@ -443,7 +499,8 @@ def mark_message_permanently_failed(message_id, error):
 
             SET sync_status = 'failed',
                 last_error = ?,
-                next_retry_at = NULL
+                next_retry_at = NULL,
+                operation_started_at = NULL
 
             WHERE message_id = ?
         """, (
@@ -454,11 +511,20 @@ def mark_message_permanently_failed(message_id, error):
 
 # ==================================================
 # GET PENDING MESSAGES
+# INCLUDES EXPIRED PROCESSING CLAIMS
 # ==================================================
 
 def get_pending_messages():
 
-    now = datetime.now(timezone.utc).isoformat()
+    now = current_time()
+
+    now_string = now.isoformat()
+
+    expired_time = (
+        now - timedelta(
+            minutes=OPERATION_TIMEOUT_MINUTES
+        )
+    ).isoformat()
 
     with get_connection() as connection:
 
@@ -467,15 +533,33 @@ def get_pending_messages():
 
             FROM processed_messages
 
-            WHERE sync_status = 'pending'
+            WHERE (
 
-              AND (
+                sync_status = 'pending'
+
+                AND (
                     next_retry_at IS NULL
                     OR next_retry_at <= ?
-              )
+                )
+
+            )
+
+            OR (
+
+                sync_status = 'processing'
+
+                AND (
+                    operation_started_at IS NULL
+                    OR operation_started_at <= ?
+                )
+
+            )
 
             ORDER BY processed_at ASC
-        """, (now,)).fetchall()
+        """, (
+            now_string,
+            expired_time
+        )).fetchall()
 
         return [
             dict(row)
@@ -576,7 +660,6 @@ def get_events_by_date(target_date):
 
 # ==================================================
 # GET ONE EVENT BY DATE
-# Backwards-compatible with monitor.py
 # ==================================================
 
 def get_event_by_date(target_date):
@@ -654,7 +737,7 @@ def enqueue_notification(
     description
 ):
 
-    now = datetime.now(timezone.utc).isoformat()
+    now = current_time_string()
 
     with get_connection() as connection:
 
@@ -691,7 +774,7 @@ def complete_message_with_notification(
     description
 ):
 
-    now = datetime.now(timezone.utc).isoformat()
+    now = current_time_string()
 
     with get_connection() as connection:
 
@@ -702,7 +785,8 @@ def complete_message_with_notification(
                 processed_at = ?,
                 retry_count = 0,
                 last_error = NULL,
-                next_retry_at = NULL
+                next_retry_at = NULL,
+                operation_started_at = NULL
 
             WHERE message_id = ?
         """, (
@@ -744,7 +828,7 @@ def fail_message_with_notification(
     description
 ):
 
-    now = datetime.now(timezone.utc).isoformat()
+    now = current_time_string()
 
     with get_connection() as connection:
 
@@ -753,7 +837,8 @@ def fail_message_with_notification(
 
             SET sync_status = 'failed',
                 last_error = ?,
-                next_retry_at = NULL
+                next_retry_at = NULL,
+                operation_started_at = NULL
 
             WHERE message_id = ?
         """, (
@@ -790,7 +875,7 @@ def fail_message_with_notification(
 
 def get_pending_notifications():
 
-    now = datetime.now(timezone.utc).isoformat()
+    now = current_time_string()
 
     with get_connection() as connection:
 
@@ -842,7 +927,7 @@ def mark_notification_failed(
     error
 ):
 
-    now = datetime.now(timezone.utc)
+    now = current_time()
 
     with get_connection() as connection:
 

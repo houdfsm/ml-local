@@ -53,13 +53,8 @@ load_dotenv(
     override=True
 )
 
-DISCORD_TOKEN = os.getenv(
-    "DISCORD_TOKEN", ""
-).strip()
-
-CHANNEL_ID = os.getenv(
-    "CHANNEL_ID", ""
-).strip()
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
 
 NOTIFICATION_CHANNEL_ID = os.getenv(
     "NOTIFICATION_CHANNEL_ID", ""
@@ -69,7 +64,6 @@ TIMEZONE_NAME = "Africa/Algiers"
 TIMEZONE = ZoneInfo(TIMEZONE_NAME)
 
 MAX_CALENDAR_ATTEMPTS = 3
-
 RETRY_DELAYS = [2, 5, 10]
 
 NOTIFICATION_CHECK_INTERVAL = 30
@@ -104,14 +98,12 @@ if not NOTIFICATION_CHANNEL_ID:
     )
 
 try:
-
     CHANNEL_ID = int(CHANNEL_ID)
     NOTIFICATION_CHANNEL_ID = int(
         NOTIFICATION_CHANNEL_ID
     )
 
 except ValueError:
-
     raise ValueError(
         "Discord channel IDs must be numbers."
     )
@@ -122,16 +114,36 @@ except ValueError:
 # ==================================================
 
 intents = discord.Intents.default()
-
 intents.message_content = True
 intents.guilds = True
 intents.messages = True
 
-client = discord.Client(
-    intents=intents
-)
+client = discord.Client(intents=intents)
 
 background_tasks_started = False
+
+# Prevent simultaneous processing of the same message.
+message_locks = {}
+
+
+# ==================================================
+# DATABASE CLAIM HELPER
+# ==================================================
+
+def claim_message(message_id):
+
+    claimed = begin_operation(message_id)
+
+    if not claimed:
+
+        logger.info(
+            "Message %s is already being processed.",
+            message_id
+        )
+
+        return False
+
+    return True
 
 
 # ==================================================
@@ -216,7 +228,11 @@ async def retry_calendar_operation(function, *args):
 # NOTIFICATION HELPERS
 # ==================================================
 
-def queue_notification(message_id, title, description):
+def queue_notification(
+    message_id,
+    title,
+    description
+):
 
     enqueue_notification(
         message_id,
@@ -275,10 +291,6 @@ def find_existing_event(start_date):
 
 def find_closure_records(target_date):
 
-    """
-    Return all saved closure records covering a date.
-    """
-
     if not target_date:
         return []
 
@@ -286,7 +298,6 @@ def find_closure_records(target_date):
         target_date
     )
 
-    # Remove duplicate records referring to the same event.
     unique_records = {}
 
     for record in records:
@@ -298,27 +309,21 @@ def find_closure_records(target_date):
         if event_id:
             unique_records[event_id] = record
 
-    return list(
-        unique_records.values()
-    )
+    return list(unique_records.values())
 
 
 # ==================================================
 # PROCESS DISCORD MESSAGE
 # ==================================================
 
-async def handle_message(
+async def _handle_message(
     message,
     edited=False,
     recovery=False
 ):
 
-    # Ignore bot messages.
-
     if message.author.bot:
         return
-
-    # Only monitor the configured channel.
 
     if message.channel.id != CHANNEL_ID:
         return
@@ -335,17 +340,12 @@ async def handle_message(
         message_id
     )
 
-    previous_record = get_message(
-        message_id
-    )
-
-    # Avoid processing completed messages again.
+    previous_record = get_message(message_id)
 
     if (
         previous_record
         and previous_record.get("sync_status") == "completed"
-        and not edited
-        and not recovery
+        and (not edited or recovery)
     ):
 
         logger.info(
@@ -354,8 +354,6 @@ async def handle_message(
         )
 
         return
-
-    # Save original Discord information.
 
     save_message(
         message_id,
@@ -393,15 +391,14 @@ async def handle_message(
                 error,
                 "Message processing failed",
                 (
-                    "The announcement could not be processed.\n"
-                    f"Error: {error}"
+                    "The announcement could not be processed. "
+                    "Please check the application logs."
                 )
             )
 
         return
 
     status = result["closure_status"]
-
     validation = result["validation"]
 
     start_date = result.get("start_date")
@@ -412,8 +409,6 @@ async def handle_message(
         status,
         validation
     )
-
-    # Save extracted information.
 
     save_message(
         message_id,
@@ -430,8 +425,6 @@ async def handle_message(
         validation=validation
     )
 
-    source_url = message.jump_url
-
     # ==================================================
     # NOT A CLOSURE
     # ==================================================
@@ -445,6 +438,9 @@ async def handle_message(
             )
 
             if old_event_id:
+
+                if not claim_message(message_id):
+                    return
 
                 try:
 
@@ -478,7 +474,11 @@ async def handle_message(
                             message_id,
                             error,
                             "Calendar deletion failed",
-                            str(error)
+                            (
+                                "The old Calendar event could not "
+                                "be removed. Please check the "
+                                "application logs."
+                            )
                         )
 
                     logger.exception(
@@ -496,7 +496,7 @@ async def handle_message(
         return
 
     # ==================================================
-    # UNCERTAIN OR INVALID ANNOUNCEMENT
+    # INVALID OR UNCERTAIN ANNOUNCEMENT
     # ==================================================
 
     if validation != "valid":
@@ -517,7 +517,7 @@ async def handle_message(
         return
 
     # ==================================================
-    # CANCELLED CLOSURE
+    # CANCELLATION
     # ==================================================
 
     if status == "cancelled":
@@ -552,7 +552,8 @@ async def handle_message(
 
             return
 
-        begin_operation(message_id)
+        if not claim_message(message_id):
+            return
 
         update_calendar_event(
             message_id,
@@ -603,8 +604,8 @@ async def handle_message(
                     "Calendar cancellation failed",
                     (
                         "The closure could not be cancelled "
-                        "after several attempts.\n"
-                        f"Error: {error}"
+                        "after several attempts. "
+                        "Please check the application logs."
                     )
                 )
 
@@ -663,7 +664,8 @@ async def handle_message(
 
             return
 
-        begin_operation(message_id)
+        if not claim_message(message_id):
+            return
 
         update_calendar_event(
             message_id,
@@ -676,8 +678,7 @@ async def handle_message(
                 update_closure_event,
                 event_id,
                 result,
-                original_message,
-                source_url
+                original_message
             )
 
             update_event_data_by_id(
@@ -714,8 +715,8 @@ async def handle_message(
                     "Calendar correction failed",
                     (
                         "The corrected closure could not be "
-                        "synchronized.\n"
-                        f"Error: {error}"
+                        "synchronized. Please check the "
+                        "application logs."
                     )
                 )
 
@@ -739,13 +740,9 @@ async def handle_message(
             reopen_date - timedelta(days=1)
         ).isoformat()
 
-        # Find closure covering the last day before reopening.
-
         matching_records = find_closure_records(
             previous_day
         )
-
-        # Also check the reopening date itself.
 
         if not matching_records:
 
@@ -756,15 +753,11 @@ async def handle_message(
         existing_event = None
         old_record = None
 
-        # Prefer the event linked to this message.
-
         if previous_record:
 
             existing_event = previous_record.get(
                 "calendar_event_id"
             )
-
-        # If there is exactly one matching event, use it.
 
         if not existing_event:
 
@@ -798,8 +791,6 @@ async def handle_message(
 
             return
 
-        # Find the original closure beginning.
-
         original_start = None
 
         if old_record:
@@ -823,7 +814,8 @@ async def handle_message(
 
             return
 
-        begin_operation(message_id)
+        if not claim_message(message_id):
+            return
 
         try:
 
@@ -898,8 +890,8 @@ async def handle_message(
                     error,
                     "Reopening synchronization failed",
                     (
-                        "The reopening could not be synchronized.\n"
-                        f"Error: {error}"
+                        "The reopening could not be synchronized. "
+                        "Please check the application logs."
                     )
                 )
 
@@ -915,23 +907,19 @@ async def handle_message(
 
     if status == "confirmed":
 
-        begin_operation(message_id)
+        if not claim_message(message_id):
+            return
 
         try:
 
             existing_record = None
             event_id = None
 
-            # Reuse the event if this Discord message
-            # was previously processed.
-
             if previous_record:
 
                 event_id = previous_record.get(
                     "calendar_event_id"
                 )
-
-            # Otherwise search for an existing closure.
 
             if not event_id:
 
@@ -956,8 +944,7 @@ async def handle_message(
                     update_closure_event,
                     event_id,
                     result,
-                    original_message,
-                    source_url
+                    original_message
                 )
 
                 update_event_data_by_id(
@@ -976,8 +963,7 @@ async def handle_message(
                     create_closure_event,
                     result,
                     original_message,
-                    message_id,
-                    source_url
+                    message_id
                 )
 
                 update_calendar_event(
@@ -1015,8 +1001,8 @@ async def handle_message(
                     "Calendar synchronization failed",
                     (
                         "The closure could not be synchronized "
-                        "after several attempts.\n"
-                        f"Error: {error}"
+                        "after several attempts. "
+                        "Please check the application logs."
                     )
                 )
 
@@ -1034,6 +1020,33 @@ async def handle_message(
         message_id,
         "The announcement type was not recognized."
     )
+
+
+# ==================================================
+# MESSAGE LOCK WRAPPER
+# ==================================================
+
+async def handle_message(
+    message,
+    edited=False,
+    recovery=False
+):
+
+    message_id = str(message.id)
+
+    if message_id not in message_locks:
+
+        message_locks[message_id] = asyncio.Lock()
+
+    lock = message_locks[message_id]
+
+    async with lock:
+
+        await _handle_message(
+            message,
+            edited=edited,
+            recovery=recovery
+        )
 
 
 # ==================================================
@@ -1306,4 +1319,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
