@@ -157,6 +157,27 @@ def get_all_messages():
 
     return [dict(row) for row in results]
 
+def get_event_by_date(closure_date):
+    connection = connect_database()
+    connection.row_factory = sqlite3.Row
+
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        SELECT *
+        FROM processed_messages
+        WHERE closure_date = ?
+        AND calendar_event_id IS NOT NULL
+        LIMIT 1
+    """, (closure_date,))
+
+    result = cursor.fetchone()
+    connection.close()
+
+    if result is None:
+        return None
+
+    return dict(result)
 
 # Test the database independently
 if __name__ == "__main__":
@@ -185,3 +206,4 @@ if __name__ == "__main__":
     print("Already processed:", is_message_processed(test_id))
     print("Retrieved message:", get_message(test_id))
     print("All messages:", get_all_messages())
+

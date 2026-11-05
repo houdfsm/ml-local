@@ -3,13 +3,18 @@ import os
 
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
+
 from message_processor import process_message
 
 from database import (
     initialize_database,
     is_message_processed,
-    save_message
+    save_message,
+    update_calendar_event,
+    get_event_by_date
 )
+
+from calendar_service import create_closure_event
 
 
 # ==================================
@@ -78,28 +83,27 @@ async def on_ready():
 async def on_message(message):
 
     print("\nMESSAGE EVENT RECEIVED")
-
     print("Author:", message.author)
     print("Channel:", message.channel.name)
     print("Channel ID:", message.channel.id)
     print("Content:", message.content)
 
-    # Ignore messages from the bot itself
+    # Ignore messages sent by the bot
     if message.author == client.user:
         return
 
-    # Ignore messages from other channels
+    # Monitor only the configured channel
     if message.channel.id != CHANNEL_ID:
         return
 
-    # Check if this message was already processed
+    # Avoid processing the same Discord message twice
     if is_message_processed(message.id):
         print("Message already processed. Skipping.")
         return
 
     print("\nNEW MESSAGE DETECTED")
 
-    # Get the original message date in Algeria timezone
+    # Get the message date in Algeria's timezone
     reference_date = message.created_at.astimezone(
         ZoneInfo("Africa/Algiers")
     ).date()
@@ -112,28 +116,84 @@ async def on_message(message):
 
     # Display processing results
     print("\n========== PROCESSING RESULT ==========")
-
     print("Original message:", result["original_message"])
     print("Normalized message:", result["normalized_message"])
     print("Closure status:", result["closure_status"])
     print("Date:", result["date"])
     print("Validation:", result["validation"])
-
     print("=======================================")
 
-    # Save the message in SQLite
-    save_message(
-        message.id,
-        message.channel.id,
-        message.author,
-        result
-    )
+    # ==================================
+    # 6. HANDLE CONFIRMED CLOSURES
+    # ==================================
 
-    print("Message saved to database!")
+    if (
+        result["closure_status"] == "confirmed"
+        and result["validation"] == "valid"
+    ):
+
+        # Save the Discord message first
+        save_message(
+            message.id,
+            message.channel.id,
+            message.author,
+            result
+        )
+
+        # Check whether an event already exists for this date
+        existing_event = get_event_by_date(result["date"])
+
+        if existing_event:
+
+            # Reuse the existing calendar event ID
+            update_calendar_event(
+                message.id,
+                existing_event["calendar_event_id"]
+            )
+
+            print("Duplicate closure detected!")
+            print("Existing calendar event reused.")
+
+        else:
+
+            try:
+
+                # Create a new Google Calendar event
+                event_id = create_closure_event(
+                    result["date"],
+                    result["original_message"]
+                )
+
+                # Link the event ID to the Discord message
+                update_calendar_event(
+                    message.id,
+                    event_id
+                )
+
+                print("New calendar event created and saved!")
+
+            except Exception as error:
+
+                print("Error creating calendar event:", error)
+
+    # ==================================
+    # 7. HANDLE OTHER MESSAGES
+    # ==================================
+
+    else:
+
+        save_message(
+            message.id,
+            message.channel.id,
+            message.author,
+            result
+        )
+
+        print("Message saved. No calendar event created.")
 
 
 # ==================================
-# 6. START THE BOT
+# 8. INITIALIZE DATABASE AND RUN BOT
 # ==================================
 
 initialize_database()
